@@ -1,65 +1,43 @@
+// ojad-alkunz-api / src/index.js
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+const express    = require('express');
+const cors       = require('cors');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const authRouter      = require('./routes/auth');
+const sessionsRouter  = require('./routes/sessions');
+const questionsRouter = require('./routes/questions');
+const categoriesRouter = require('./routes/categories');
+const viewersRouter   = require('./routes/viewers');
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
-const allowedOrigins = [
-  'http://localhost:5173',   // Vite dev
-  'http://localhost:3001',
-  process.env.FRONTEND_URL   // Vercel production
-].filter(Boolean);
+const app  = express();
+const PORT = process.env.PORT || 3001;
 
+// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (Postman, Render health checks)
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS: origin ${origin} not allowed`));
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-password']
+  origin: process.env.FRONTEND_URL || '*',
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-cleanup-secret'],
 }));
-
-// ── Body parser ───────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '5mb' }));
-
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({
-    service: 'اوجد الكنز API',
-    version: '1.0.0',
-    status: 'running',
-    timestamp: new Date().toISOString()
-  });
-});
+app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.use('/api/auth',       require('./routes/auth'));
-app.use('/api/categories', require('./routes/categories'));
-app.use('/api/questions',  require('./routes/questions'));
-app.use('/api/sessions',   require('./routes/sessions'));
+app.use('/api/auth',       authRouter);
+app.use('/api/sessions',   sessionsRouter);
+app.use('/api/questions',  questionsRouter);
+app.use('/api/categories', categoriesRouter);
 
-// ── 404 ───────────────────────────────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` });
-});
+// Viewers are nested under sessions: /api/sessions/:id/viewers
+// sessions.js handles /api/sessions/:id/viewers/* via viewersRouter
+// We mount viewersRouter inside sessionsRouter using mergeParams
+// But since sessions.js already exports its own router, we re-mount here:
+app.use('/api/sessions/:id/viewers', viewersRouter);
 
-// ── Global error handler ──────────────────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: err.message || 'Internal Server Error' });
-});
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ اوجد الكنز API running on port ${PORT}`);
-  console.log(`   Supabase: ${process.env.SUPABASE_URL}`);
-  console.log(`   Mode: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
 
 module.exports = app;
