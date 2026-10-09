@@ -38,4 +38,4 @@ router.get('/verify', (req, res) => {
   res.status(401).json({ valid: false });
 });
 
-module.exports = router;
+module.exports = authRouter;
