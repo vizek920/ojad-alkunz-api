@@ -1,185 +1,352 @@
+// ojad-alkunz-api / src/routes/sessions.js
 const express = require('express');
+const { createClient } = require('@supabase/supabase-js');
+
 const router = express.Router();
-const { v4: uuidv4 } = require('uuid');
-const supabase = require('../supabase');
-const { requireAdmin } = require('../middleware/auth');
 
-// GET /api/sessions — list all sessions (admin)
-router.get('/', requireAdmin, async (req, res) => {
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+// ─── Helper: verify host password ────────────────────────────────────────────
+async function verifyHost(sessionId, password) {
   const { data, error } = await supabase
     .from('sessions')
-    .select(`
-      *,
-      session_teams (*)
-    `)
-    .order('created_at', { ascending: false });
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
-
-// GET /api/sessions/:id — get full session state (public, used by big screen)
-router.get('/:id', async (req, res) => {
-  const { data, error } = await supabase
-    .from('sessions')
-    .select(`
-      *,
-      session_teams (*),
-      session_stages (*)
-    `)
-    .eq('id', req.params.id)
+    .select('id, password')
+    .eq('id', sessionId)
     .single();
+  if (error || !data) return false;
+  return data.password === password;
+}
 
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(404).json({ error: 'Session not found' });
-  res.json(data);
-});
+// ─── GET /api/sessions ────────────────────────────────────────────────────────
+// List sessions (public lobby). Filters: status, is_private
+router.get('/', async (req, res) => {
+  try {
+    const { status, is_private, limit = 50 } = req.query;
 
-// POST /api/sessions — create a new game session (admin)
-router.post('/', requireAdmin, async (req, res) => {
-  const { event_name, team1_name, team2_name, total_stages = 15 } = req.body;
+    let q = supabase
+      .from('sessions')
+      .select(`
+        id, title, code, is_private, max_viewers,
+        current_stage, status, created_at,
+        session_teams(count),
+        session_viewer_counts(viewer_count)
+      `)
+      .order('created_at', { ascending: false })
+      .limit(Number(limit));
 
-  if (!event_name || !team1_name || !team2_name) {
-    return res.status(400).json({
-      error: 'Missing: event_name, team1_name, team2_name'
-    });
+    if (status)     q = q.eq('status', status);
+    if (is_private !== undefined) q = q.eq('is_private', is_private === 'true' || is_private === true);
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    // Flatten viewer counts
+    const sessions = (data || []).map(s => ({
+      ...s,
+      team_count:   s.session_teams?.[0]?.count || 0,
+      viewer_count: s.session_viewer_counts?.[0]?.viewer_count || 0,
+      session_teams: undefined,
+      session_viewer_counts: undefined,
+    }));
+
+    res.json({ sessions });
+  } catch (err) {
+    console.error('GET /sessions:', err);
+    res.status(500).json({ error: err.message });
   }
-
-  const sessionId = uuidv4();
-
-  // Create session
-  const { data: session, error: sessionError } = await supabase
-    .from('sessions')
-    .insert({
-      id: sessionId,
-      event_name,
-      total_stages,
-      current_stage: 1,
-      current_turn: 'team1', // team1 starts
-      status: 'waiting'      // waiting | active | finished
-    })
-    .select()
-    .single();
-
-  if (sessionError) return res.status(500).json({ error: sessionError.message });
-
-  // Create both teams
-  const teams = [
-    { session_id: sessionId, team_key: 'team1', name: team1_name, score: 0, lives: 2 },
-    { session_id: sessionId, team_key: 'team2', name: team2_name, score: 0, lives: 2 }
-  ];
-
-  const { error: teamsError } = await supabase
-    .from('session_teams')
-    .insert(teams);
-
-  if (teamsError) return res.status(500).json({ error: teamsError.message });
-
-  // Initialize all stages
-  const stages = Array.from({ length: total_stages }, (_, i) => ({
-    session_id: sessionId,
-    stage_number: i + 1,
-    status: i === 0 ? 'active' : 'pending',
-    team1_stage_score: 0,
-    team2_stage_score: 0,
-    team1_lives: 2,
-    team2_lives: 2,
-    team1_used_double: false,
-    team2_used_double: false,
-    winner: null,
-    treasure_icon: null,
-    treasure_name: null,
-    treasure_desc: null
-  }));
-
-  const { error: stagesError } = await supabase
-    .from('session_stages')
-    .insert(stages);
-
-  if (stagesError) return res.status(500).json({ error: stagesError.message });
-
-  res.status(201).json({ session_id: sessionId, event_name });
 });
 
-// PATCH /api/sessions/:id/state — update game state (admin)
-// Used by admin panel to push live state changes
-router.patch('/:id/state', requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const {
-    current_stage,
-    current_turn,
-    status,
-    current_question_id,
-    show_question,
-    show_answer,
-    timer_seconds
-  } = req.body;
+// ─── GET /api/sessions/code/:code ─────────────────────────────────────────────
+// Look up a session by 6-digit code (for join modal)
+router.get('/code/:code', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('sessions')
+      .select('id, title, code, is_private, status, current_stage')
+      .eq('code', req.params.code)
+      .single();
 
-  const updates = {};
-  if (current_stage !== undefined) updates.current_stage = current_stage;
-  if (current_turn !== undefined) updates.current_turn = current_turn;
-  if (status !== undefined) updates.status = status;
-  if (current_question_id !== undefined) updates.current_question_id = current_question_id;
-  if (show_question !== undefined) updates.show_question = show_question;
-  if (show_answer !== undefined) updates.show_answer = show_answer;
-  if (timer_seconds !== undefined) updates.timer_seconds = timer_seconds;
-  updates.updated_at = new Date().toISOString();
+    if (error || !data) return res.status(404).json({ error: 'الرمز غير صحيح أو الجلسة غير موجودة' });
+    if (data.status !== 'active') return res.status(410).json({ error: 'الجلسة منتهية' });
 
-  const { data, error } = await supabase
-    .from('sessions')
-    .update(updates)
-    .eq('id', id)
-    .select()
-    .single();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// PATCH /api/sessions/:id/stage — update a specific stage (admin)
-router.patch('/:id/stage/:stage', requireAdmin, async (req, res) => {
-  const { id, stage } = req.params;
-  const updates = req.body;
+// ─── GET /api/sessions/:id ────────────────────────────────────────────────────
+router.get('/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('sessions')
+      .select(`
+        id, title, code, is_private, max_viewers,
+        current_stage, status, created_at,
+        session_teams(id, name, score, color),
+        session_viewer_counts(viewer_count)
+      `)
+      .eq('id', req.params.id)
+      .single();
 
-  const { data, error } = await supabase
-    .from('session_stages')
-    .update(updates)
-    .eq('session_id', id)
-    .eq('stage_number', Number(stage))
-    .select()
-    .single();
+    if (error || !data) return res.status(404).json({ error: 'الجلسة غير موجودة' });
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+    res.json({
+      ...data,
+      viewer_count: data.session_viewer_counts?.[0]?.viewer_count || 0,
+      session_viewer_counts: undefined,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// PATCH /api/sessions/:id/team/:teamKey — update team score/lives (admin)
-router.patch('/:id/team/:teamKey', requireAdmin, async (req, res) => {
-  const { id, teamKey } = req.params;
-  const updates = req.body;
+// ─── POST /api/sessions ───────────────────────────────────────────────────────
+// Create a new session (from homepage)
+router.post('/', async (req, res) => {
+  try {
+    const { title, password, is_private = false, max_viewers = 50 } = req.body;
 
-  const { data, error } = await supabase
-    .from('session_teams')
-    .update(updates)
-    .eq('session_id', id)
-    .eq('team_key', teamKey)
-    .select()
-    .single();
+    if (!title?.trim())    return res.status(400).json({ error: 'اسم الجلسة مطلوب' });
+    if (!password?.trim()) return res.status(400).json({ error: 'كلمة المرور مطلوبة' });
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+    const { data, error } = await supabase
+      .from('sessions')
+      .insert({
+        title:       title.trim(),
+        password:    password.trim(),
+        is_private:  Boolean(is_private),
+        max_viewers: Number(max_viewers) || 50,
+        status:      'active',
+        current_stage: 1,
+        host_last_seen: new Date().toISOString(),
+        // code is auto-generated by DB trigger
+      })
+      .select('id, title, code, is_private, max_viewers, status')
+      .single();
+
+    if (error) throw error;
+
+    // Return session WITHOUT exposing the real password — just a hint
+    res.status(201).json({
+      ...data,
+      password_hint: password.slice(0, 1) + '•'.repeat(password.length - 1),
+    });
+  } catch (err) {
+    console.error('POST /sessions:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// DELETE /api/sessions/:id — delete session (admin)
-router.delete('/:id', requireAdmin, async (req, res) => {
-  // Cascades via FK to session_teams and session_stages
-  const { error } = await supabase
-    .from('sessions')
-    .delete()
-    .eq('id', req.params.id);
+// ─── PUT /api/sessions/:id ────────────────────────────────────────────────────
+// Update session (status, current_stage, title, etc.) — requires host password
+router.put('/:id', async (req, res) => {
+  try {
+    const { password, ...updates } = req.body;
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
+    const ok = await verifyHost(req.params.id, password);
+    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+
+    // Whitelist updatable fields
+    const allowed = ['title', 'status', 'current_stage', 'is_private', 'max_viewers'];
+    const patch = {};
+    for (const k of allowed) {
+      if (k in updates) patch[k] = updates[k];
+    }
+
+    const { data, error } = await supabase
+      .from('sessions')
+      .update(patch)
+      .eq('id', req.params.id)
+      .select('id, title, status, current_stage, is_private, max_viewers')
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── DELETE /api/sessions/:id ─────────────────────────────────────────────────
+// Close/delete a session — requires host password
+router.delete('/:id', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const ok = await verifyHost(req.params.id, password);
+    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+
+    const { error } = await supabase
+      .from('sessions')
+      .update({ status: 'done' })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/sessions/:id/heartbeat ─────────────────────────────────────────
+// Host sends this every 30s to prevent auto-close
+router.post('/:id/heartbeat', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const ok = await verifyHost(req.params.id, password);
+    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+
+    const { error } = await supabase
+      .from('sessions')
+      .update({ host_last_seen: new Date().toISOString() })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    res.json({ ok: true, timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/sessions/:id/validate ─────────────────────────────────────────
+// Validate host password (used when host enters existing session)
+router.post('/:id/validate', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const ok = await verifyHost(req.params.id, password);
+    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+
+    // Return basic session info on success
+    const { data } = await supabase
+      .from('sessions')
+      .select('id, title, code, status, current_stage, is_private, max_viewers')
+      .eq('id', req.params.id)
+      .single();
+
+    res.json({ valid: true, session: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Auto-close inactive sessions (call from a periodic job) ─────────────────
+// POST /api/sessions/cleanup — internal use only (protected by secret header)
+router.post('/cleanup', async (req, res) => {
+  const secret = req.headers['x-cleanup-secret'];
+  if (secret !== process.env.CLEANUP_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  try {
+    const { error } = await supabase.rpc('close_inactive_sessions');
+    if (error) throw error;
+    await supabase.rpc('cleanup_old_viewers');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Teams sub-routes ────────────────────────────────────────────────────────
+
+// GET /api/sessions/:id/teams
+router.get('/:id/teams', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('session_teams')
+      .select('*')
+      .eq('session_id', req.params.id)
+      .order('score', { ascending: false });
+    if (error) throw error;
+    res.json({ teams: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sessions/:id/teams
+router.post('/:id/teams', async (req, res) => {
+  try {
+    const { name, color } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'اسم الفريق مطلوب' });
+
+    const { data, error } = await supabase
+      .from('session_teams')
+      .insert({ session_id: req.params.id, name: name.trim(), color: color || '#C9A227', score: 0 })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/sessions/:id/teams/:teamId
+router.put('/:id/teams/:teamId', async (req, res) => {
+  try {
+    const allowed = ['name', 'score', 'color'];
+    const patch = {};
+    for (const k of allowed) { if (k in req.body) patch[k] = req.body[k]; }
+
+    const { data, error } = await supabase
+      .from('session_teams')
+      .update(patch)
+      .eq('id', req.params.teamId)
+      .eq('session_id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sessions/:id/teams/:teamId/points
+router.post('/:id/teams/:teamId/points', async (req, res) => {
+  try {
+    const { points } = req.body;
+    if (points === undefined) return res.status(400).json({ error: 'points مطلوب' });
+
+    // Atomic increment/decrement
+    const { data: team } = await supabase
+      .from('session_teams')
+      .select('score')
+      .eq('id', req.params.teamId)
+      .single();
+
+    const newScore = Math.max(0, (team?.score || 0) + Number(points));
+
+    const { data, error } = await supabase
+      .from('session_teams')
+      .update({ score: newScore })
+      .eq('id', req.params.teamId)
+      .eq('session_id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/sessions/:id/teams/:teamId
+router.delete('/:id/teams/:teamId', async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('session_teams')
+      .delete()
+      .eq('id', req.params.teamId)
+      .eq('session_id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;
