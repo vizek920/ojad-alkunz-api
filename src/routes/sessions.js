@@ -33,8 +33,8 @@ router.get('/', async (req, res) => {
       .select(`
         id, name, code, status, is_private, max_viewers,
         created_at, host_last_seen,
-        teams:teams(count),
-        viewers:session_viewers(count)
+        teams(count),
+        session_viewers(count)
       `)
       .order('created_at', { ascending: false });
 
@@ -48,9 +48,9 @@ router.get('/', async (req, res) => {
     const sessions = (data || []).map(s => ({
       ...s,
       team_count: s.teams?.[0]?.count || 0,
-      viewer_count: s.viewers?.[0]?.count || 0,
+      viewer_count: s.session_viewers?.[0]?.count || 0,
       teams: undefined,
-      viewers: undefined,
+      session_viewers: undefined,
     }));
 
     res.json({ sessions });
