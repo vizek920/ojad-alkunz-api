@@ -12,12 +12,32 @@ const viewersRouter   = require('./routes/viewers');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ── Middleware ────────────────────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+
+    const allowed = [
+      process.env.FRONTEND_URL,          // e.g. https://ojad-alkunz.vercel.app
+      'https://ojad-alkunz.vercel.app',  // fallback hardcoded
+    ].filter(Boolean);
+
+    // Allow any *.vercel.app subdomain (covers preview deployments)
+    if (
+      origin.endsWith('.vercel.app') ||
+      allowed.includes(origin)
+    ) {
+      return callback(null, true);
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-cleanup-secret'],
+  credentials: true,
 }));
+
 app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -26,10 +46,7 @@ app.use('/api/sessions',   sessionsRouter);
 app.use('/api/questions',  questionsRouter);
 app.use('/api/categories', categoriesRouter);
 
-// Viewers are nested under sessions: /api/sessions/:id/viewers
-// sessions.js handles /api/sessions/:id/viewers/* via viewersRouter
-// We mount viewersRouter inside sessionsRouter using mergeParams
-// But since sessions.js already exports its own router, we re-mount here:
+// Viewers nested under sessions: /api/sessions/:id/viewers
 app.use('/api/sessions/:id/viewers', viewersRouter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
