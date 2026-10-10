@@ -9,195 +9,177 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ─── Helper: verify host password ────────────────────────────────────────────
+// ── Helper: verify host password ─────────────────────────────────────────────
 async function verifyHost(sessionId, password) {
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from('sessions')
-    .select('id, password')
+    .select('password')
     .eq('id', sessionId)
     .single();
-  if (error || !data) return false;
-  return data.password === password;
+  if (!data) throw new Error('الجلسة غير موجودة');
+  if (data.password !== password) throw new Error('كلمة المرور غير صحيحة');
+  return true;
 }
 
-// ─── GET /api/sessions ────────────────────────────────────────────────────────
-// List sessions (public lobby). Filters: status, is_private
+// ── GET /api/sessions ─────────────────────────────────────────────────────────
+// Public: list active public sessions (for HomePage lobby)
+// Supports ?status=active&is_private=false
 router.get('/', async (req, res) => {
   try {
-    const { status, is_private, limit = 50 } = req.query;
+    const { status, is_private } = req.query;
 
-    let q = supabase
+    let query = supabase
       .from('sessions')
       .select(`
-        id, title, code, is_private, max_viewers,
-        current_stage, status, created_at,
-        session_teams(count),
-        session_viewer_counts(viewer_count)
+        id, name, code, status, is_private, max_viewers,
+        created_at, host_last_seen,
+        teams:teams(count),
+        viewers:session_viewers(count)
       `)
-      .order('created_at', { ascending: false })
-      .limit(Number(limit));
+      .order('created_at', { ascending: false });
 
-    if (status)     q = q.eq('status', status);
-    if (is_private !== undefined) q = q.eq('is_private', is_private === 'true' || is_private === true);
+    if (status) query = query.eq('status', status);
+    if (is_private !== undefined) query = query.eq('is_private', is_private === 'true' || is_private === true);
 
-    const { data, error } = await q;
+    const { data, error } = await query;
     if (error) throw error;
 
-    // Flatten viewer counts
+    // Format response
     const sessions = (data || []).map(s => ({
       ...s,
-      team_count:   s.session_teams?.[0]?.count || 0,
-      viewer_count: s.session_viewer_counts?.[0]?.viewer_count || 0,
-      session_teams: undefined,
-      session_viewer_counts: undefined,
+      team_count: s.teams?.[0]?.count || 0,
+      viewer_count: s.viewers?.[0]?.count || 0,
+      teams: undefined,
+      viewers: undefined,
     }));
 
     res.json({ sessions });
   } catch (err) {
-    console.error('GET /sessions:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/sessions/code/:code ─────────────────────────────────────────────
-// Look up a session by 6-digit code (for join modal)
+// ── GET /api/sessions/code/:code ──────────────────────────────────────────────
+// Look up session by 6-digit code
 router.get('/code/:code', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('sessions')
-      .select('id, title, code, is_private, status, current_stage')
+      .select('id, name, code, status, is_private, max_viewers, created_at')
       .eq('code', req.params.code)
       .single();
 
-    if (error || !data) return res.status(404).json({ error: 'الرمز غير صحيح أو الجلسة غير موجودة' });
-    if (data.status !== 'active') return res.status(410).json({ error: 'الجلسة منتهية' });
-
-    res.json(data);
+    if (error || !data) return res.status(404).json({ error: 'الرمز غير صحيح' });
+    res.json({ session: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── GET /api/sessions/:id ────────────────────────────────────────────────────
+// ── GET /api/sessions/:id ─────────────────────────────────────────────────────
+// Public: get full session data (used by BigScreenPage + GameControl)
 router.get('/:id', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('sessions')
       .select(`
-        id, title, code, is_private, max_viewers,
-        current_stage, status, created_at,
-        session_teams(id, name, score, color),
-        session_viewer_counts(viewer_count)
+        *,
+        teams(*),
+        stages(*)
       `)
       .eq('id', req.params.id)
       .single();
 
     if (error || !data) return res.status(404).json({ error: 'الجلسة غير موجودة' });
-
-    res.json({
-      ...data,
-      viewer_count: data.session_viewer_counts?.[0]?.viewer_count || 0,
-      session_viewer_counts: undefined,
-    });
+    res.json({ session: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/sessions ───────────────────────────────────────────────────────
-// Create a new session (from homepage)
+// ── POST /api/sessions ────────────────────────────────────────────────────────
+// Public: create a new session
 router.post('/', async (req, res) => {
   try {
-    const { title, password, is_private = false, max_viewers = 50 } = req.body;
+    const {
+      name,
+      password,
+      is_private = false,
+      max_viewers = 50,
+      team1_name = 'الفريق الأول',
+      team2_name = 'الفريق الثاني',
+      stage_count = 15,
+    } = req.body;
 
-    if (!title?.trim())    return res.status(400).json({ error: 'اسم الجلسة مطلوب' });
-    if (!password?.trim()) return res.status(400).json({ error: 'كلمة المرور مطلوبة' });
+    if (!name) return res.status(400).json({ error: 'اسم الجلسة مطلوب' });
+    if (!password) return res.status(400).json({ error: 'كلمة المرور مطلوبة' });
 
-    const { data, error } = await supabase
+    // Create session (code generated by DB trigger)
+    const { data: session, error: sErr } = await supabase
       .from('sessions')
       .insert({
-        title:       title.trim(),
-        password:    password.trim(),
-        is_private:  Boolean(is_private),
-        max_viewers: Number(max_viewers) || 50,
-        status:      'active',
-        current_stage: 1,
+        name,
+        password,
+        is_private,
+        max_viewers,
+        status: 'active',
         host_last_seen: new Date().toISOString(),
-        // code is auto-generated by DB trigger
       })
-      .select('id, title, code, is_private, max_viewers, status')
+      .select()
       .single();
 
-    if (error) throw error;
+    if (sErr) throw sErr;
 
-    // Return session WITHOUT exposing the real password — just a hint
-    res.status(201).json({
-      ...data,
-      password_hint: password.slice(0, 1) + '•'.repeat(password.length - 1),
-    });
-  } catch (err) {
-    console.error('POST /sessions:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    // Create two teams
+    const { error: tErr } = await supabase.from('teams').insert([
+      { session_id: session.id, key: 'team1', name: team1_name, score: 0, lives: 2 },
+      { session_id: session.id, key: 'team2', name: team2_name, score: 0, lives: 2 },
+    ]);
+    if (tErr) throw tErr;
 
-// ─── PUT /api/sessions/:id ────────────────────────────────────────────────────
-// Update session (status, current_stage, title, etc.) — requires host password
-router.put('/:id', async (req, res) => {
-  try {
-    const { password, ...updates } = req.body;
+    // Create stages
+    const stages = Array.from({ length: stage_count }, (_, i) => ({
+      session_id: session.id,
+      stage_number: i + 1,
+      status: i === 0 ? 'active' : 'pending',
+    }));
+    const { error: stErr } = await supabase.from('stages').insert(stages);
+    if (stErr) throw stErr;
 
-    const ok = await verifyHost(req.params.id, password);
-    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
-
-    // Whitelist updatable fields
-    const allowed = ['title', 'status', 'current_stage', 'is_private', 'max_viewers'];
-    const patch = {};
-    for (const k of allowed) {
-      if (k in updates) patch[k] = updates[k];
-    }
-
-    const { data, error } = await supabase
-      .from('sessions')
-      .update(patch)
-      .eq('id', req.params.id)
-      .select('id, title, status, current_stage, is_private, max_viewers')
-      .single();
-
-    if (error) throw error;
-    res.json(data);
+    res.status(201).json({ session });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── DELETE /api/sessions/:id ─────────────────────────────────────────────────
-// Close/delete a session — requires host password
-router.delete('/:id', async (req, res) => {
+// ── POST /api/sessions/:id/validate ──────────────────────────────────────────
+// Verify host password — returns session data if correct
+router.post('/:id/validate', async (req, res) => {
   try {
     const { password } = req.body;
-    const ok = await verifyHost(req.params.id, password);
-    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+    if (!password) return res.status(400).json({ error: 'كلمة المرور مطلوبة' });
 
-    const { error } = await supabase
+    const { data: session, error } = await supabase
       .from('sessions')
-      .update({ status: 'done' })
-      .eq('id', req.params.id);
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
 
-    if (error) throw error;
-    res.json({ success: true });
+    if (error || !session) return res.status(404).json({ error: 'الجلسة غير موجودة' });
+    if (session.password !== password) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+
+    res.json({ session });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── POST /api/sessions/:id/heartbeat ─────────────────────────────────────────
-// Host sends this every 30s to prevent auto-close
+// ── POST /api/sessions/:id/heartbeat ─────────────────────────────────────────
+// Host heartbeat — keeps session alive
 router.post('/:id/heartbeat', async (req, res) => {
   try {
     const { password } = req.body;
-    const ok = await verifyHost(req.params.id, password);
-    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
+    await verifyHost(req.params.id, password);
 
     const { error } = await supabase
       .from('sessions')
@@ -205,145 +187,144 @@ router.post('/:id/heartbeat', async (req, res) => {
       .eq('id', req.params.id);
 
     if (error) throw error;
-    res.json({ ok: true, timestamp: new Date().toISOString() });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── POST /api/sessions/:id/validate ─────────────────────────────────────────
-// Validate host password (used when host enters existing session)
-router.post('/:id/validate', async (req, res) => {
-  try {
-    const { password } = req.body;
-    const ok = await verifyHost(req.params.id, password);
-    if (!ok) return res.status(401).json({ error: 'كلمة المرور غير صحيحة' });
-
-    // Return basic session info on success
-    const { data } = await supabase
-      .from('sessions')
-      .select('id, title, code, status, current_stage, is_private, max_viewers')
-      .eq('id', req.params.id)
-      .single();
-
-    res.json({ valid: true, session: data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── Auto-close inactive sessions (call from a periodic job) ─────────────────
-// POST /api/sessions/cleanup — internal use only (protected by secret header)
-router.post('/cleanup', async (req, res) => {
-  const secret = req.headers['x-cleanup-secret'];
-  if (secret !== process.env.CLEANUP_SECRET) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-  try {
-    const { error } = await supabase.rpc('close_inactive_sessions');
-    if (error) throw error;
-    await supabase.rpc('cleanup_old_viewers');
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Teams sub-routes ────────────────────────────────────────────────────────
-
-// GET /api/sessions/:id/teams
-router.get('/:id/teams', async (req, res) => {
+// ── PATCH /api/sessions/:id/state ─────────────────────────────────────────────
+// Update session live state (host only)
+router.patch('/:id/state', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('session_teams')
-      .select('*')
-      .eq('session_id', req.params.id)
-      .order('score', { ascending: false });
-    if (error) throw error;
-    res.json({ teams: data || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+    const { password, ...fields } = req.body;
+    await verifyHost(req.params.id, password);
 
-// POST /api/sessions/:id/teams
-router.post('/:id/teams', async (req, res) => {
-  try {
-    const { name, color } = req.body;
-    if (!name?.trim()) return res.status(400).json({ error: 'اسم الفريق مطلوب' });
+    const allowed = [
+      'current_stage', 'current_turn', 'status', 'current_question',
+      'show_answer', 'timer_seconds', 'updated_at'
+    ];
+    const update = {};
+    for (const k of allowed) {
+      if (fields[k] !== undefined) update[k] = fields[k];
+    }
+    update.updated_at = new Date().toISOString();
 
-    const { data, error } = await supabase
-      .from('session_teams')
-      .insert({ session_id: req.params.id, name: name.trim(), color: color || '#C9A227', score: 0 })
-      .select()
-      .single();
-    if (error) throw error;
-    res.status(201).json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// PUT /api/sessions/:id/teams/:teamId
-router.put('/:id/teams/:teamId', async (req, res) => {
-  try {
-    const allowed = ['name', 'score', 'color'];
-    const patch = {};
-    for (const k of allowed) { if (k in req.body) patch[k] = req.body[k]; }
-
-    const { data, error } = await supabase
-      .from('session_teams')
-      .update(patch)
-      .eq('id', req.params.teamId)
-      .eq('session_id', req.params.id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/sessions/:id/teams/:teamId/points
-router.post('/:id/teams/:teamId/points', async (req, res) => {
-  try {
-    const { points } = req.body;
-    if (points === undefined) return res.status(400).json({ error: 'points مطلوب' });
-
-    // Atomic increment/decrement
-    const { data: team } = await supabase
-      .from('session_teams')
-      .select('score')
-      .eq('id', req.params.teamId)
-      .single();
-
-    const newScore = Math.max(0, (team?.score || 0) + Number(points));
-
-    const { data, error } = await supabase
-      .from('session_teams')
-      .update({ score: newScore })
-      .eq('id', req.params.teamId)
-      .eq('session_id', req.params.id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// DELETE /api/sessions/:id/teams/:teamId
-router.delete('/:id/teams/:teamId', async (req, res) => {
-  try {
     const { error } = await supabase
-      .from('session_teams')
-      .delete()
-      .eq('id', req.params.teamId)
-      .eq('session_id', req.params.id);
+      .from('sessions')
+      .update(update)
+      .eq('id', req.params.id);
+
     if (error) throw error;
-    res.json({ success: true });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PATCH /api/sessions/:id/stage/:stage ──────────────────────────────────────
+router.patch('/:id/stage/:stage', async (req, res) => {
+  try {
+    const { password, ...fields } = req.body;
+    await verifyHost(req.params.id, password);
+
+    const { error } = await supabase
+      .from('stages')
+      .update(fields)
+      .eq('session_id', req.params.id)
+      .eq('stage_number', req.params.stage);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PATCH /api/sessions/:id/team/:teamKey ────────────────────────────────────
+router.patch('/:id/team/:teamKey', async (req, res) => {
+  try {
+    const { password, ...fields } = req.body;
+    await verifyHost(req.params.id, password);
+
+    const { error } = await supabase
+      .from('teams')
+      .update(fields)
+      .eq('session_id', req.params.id)
+      .eq('key', req.params.teamKey);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/sessions/:id/teams/:teamKey/points ──────────────────────────────
+// Add/subtract points atomically
+router.post('/:id/teams/:teamKey/points', async (req, res) => {
+  try {
+    const { password, delta } = req.body;
+    await verifyHost(req.params.id, password);
+
+    const { data: team, error: fetchErr } = await supabase
+      .from('teams')
+      .select('score')
+      .eq('session_id', req.params.id)
+      .eq('key', req.params.teamKey)
+      .single();
+
+    if (fetchErr || !team) throw new Error('الفريق غير موجود');
+
+    const newScore = Math.max(0, (team.score || 0) + (delta || 0));
+    const { error } = await supabase
+      .from('teams')
+      .update({ score: newScore })
+      .eq('session_id', req.params.id)
+      .eq('key', req.params.teamKey);
+
+    if (error) throw error;
+    res.json({ ok: true, score: newScore });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /api/sessions/:id ──────────────────────────────────────────────────
+// Close/delete session (host only)
+router.delete('/:id', async (req, res) => {
+  try {
+    const { password } = req.body;
+    await verifyHost(req.params.id, password);
+
+    const { error } = await supabase
+      .from('sessions')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/sessions/cleanup ───────────────────────────────────────────────
+// Protected cleanup — called by cron job
+router.post('/cleanup', async (req, res) => {
+  try {
+    const secret = req.headers['x-cleanup-secret'];
+    if (!secret || secret !== process.env.CLEANUP_SECRET) {
+      return res.status(401).json({ error: 'غير مصرح' });
+    }
+
+    const { error: e1 } = await supabase.rpc('close_inactive_sessions');
+    const { error: e2 } = await supabase.rpc('cleanup_old_viewers');
+
+    if (e1) console.error('close_inactive_sessions:', e1.message);
+    if (e2) console.error('cleanup_old_viewers:', e2.message);
+
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
