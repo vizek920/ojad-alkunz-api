@@ -23,7 +23,6 @@ async function verifyHost(sessionId, password) {
 
 // ── GET /api/sessions ─────────────────────────────────────────────────────────
 // Public: list active public sessions (for HomePage lobby)
-// Supports ?status=active&is_private=false
 router.get('/', async (req, res) => {
   try {
     const { status, is_private } = req.query;
@@ -33,23 +32,24 @@ router.get('/', async (req, res) => {
       .select(`
         id, name, code, status, is_private, max_viewers,
         created_at, host_last_seen,
-        teams(count),
+        session_teams(count),
         session_viewers(count)
       `)
       .order('created_at', { ascending: false });
 
     if (status) query = query.eq('status', status);
-    if (is_private !== undefined) query = query.eq('is_private', is_private === 'true' || is_private === true);
+    if (is_private !== undefined) {
+      query = query.eq('is_private', is_private === 'true' || is_private === true);
+    }
 
     const { data, error } = await query;
     if (error) throw error;
 
-    // Format response
     const sessions = (data || []).map(s => ({
       ...s,
-      team_count: s.teams?.[0]?.count || 0,
+      team_count: s.session_teams?.[0]?.count || 0,
       viewer_count: s.session_viewers?.[0]?.count || 0,
-      teams: undefined,
+      session_teams: undefined,
       session_viewers: undefined,
     }));
 
@@ -60,7 +60,6 @@ router.get('/', async (req, res) => {
 });
 
 // ── GET /api/sessions/code/:code ──────────────────────────────────────────────
-// Look up session by 6-digit code
 router.get('/code/:code', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -77,15 +76,14 @@ router.get('/code/:code', async (req, res) => {
 });
 
 // ── GET /api/sessions/:id ─────────────────────────────────────────────────────
-// Public: get full session data (used by BigScreenPage + GameControl)
 router.get('/:id', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('sessions')
       .select(`
         *,
-        teams(*),
-        stages(*)
+        session_teams(*),
+        session_stages(*)
       `)
       .eq('id', req.params.id)
       .single();
@@ -98,7 +96,6 @@ router.get('/:id', async (req, res) => {
 });
 
 // ── POST /api/sessions ────────────────────────────────────────────────────────
-// Public: create a new session
 router.post('/', async (req, res) => {
   try {
     const {
@@ -131,9 +128,9 @@ router.post('/', async (req, res) => {
     if (sErr) throw sErr;
 
     // Create two teams
-    const { error: tErr } = await supabase.from('teams').insert([
-      { session_id: session.id, key: 'team1', name: team1_name, score: 0, lives: 2 },
-      { session_id: session.id, key: 'team2', name: team2_name, score: 0, lives: 2 },
+    const { error: tErr } = await supabase.from('session_teams').insert([
+      { session_id: session.id, team_key: 'team1', name: team1_name, score: 0, lives: 2 },
+      { session_id: session.id, team_key: 'team2', name: team2_name, score: 0, lives: 2 },
     ]);
     if (tErr) throw tErr;
 
@@ -143,7 +140,7 @@ router.post('/', async (req, res) => {
       stage_number: i + 1,
       status: i === 0 ? 'active' : 'pending',
     }));
-    const { error: stErr } = await supabase.from('stages').insert(stages);
+    const { error: stErr } = await supabase.from('session_stages').insert(stages);
     if (stErr) throw stErr;
 
     res.status(201).json({ session });
@@ -153,7 +150,6 @@ router.post('/', async (req, res) => {
 });
 
 // ── POST /api/sessions/:id/validate ──────────────────────────────────────────
-// Verify host password — returns session data if correct
 router.post('/:id/validate', async (req, res) => {
   try {
     const { password } = req.body;
@@ -175,7 +171,6 @@ router.post('/:id/validate', async (req, res) => {
 });
 
 // ── POST /api/sessions/:id/heartbeat ─────────────────────────────────────────
-// Host heartbeat — keeps session alive
 router.post('/:id/heartbeat', async (req, res) => {
   try {
     const { password } = req.body;
@@ -194,7 +189,6 @@ router.post('/:id/heartbeat', async (req, res) => {
 });
 
 // ── PATCH /api/sessions/:id/state ─────────────────────────────────────────────
-// Update session live state (host only)
 router.patch('/:id/state', async (req, res) => {
   try {
     const { password, ...fields } = req.body;
@@ -229,7 +223,7 @@ router.patch('/:id/stage/:stage', async (req, res) => {
     await verifyHost(req.params.id, password);
 
     const { error } = await supabase
-      .from('stages')
+      .from('session_stages')
       .update(fields)
       .eq('session_id', req.params.id)
       .eq('stage_number', req.params.stage);
@@ -248,10 +242,10 @@ router.patch('/:id/team/:teamKey', async (req, res) => {
     await verifyHost(req.params.id, password);
 
     const { error } = await supabase
-      .from('teams')
+      .from('session_teams')
       .update(fields)
       .eq('session_id', req.params.id)
-      .eq('key', req.params.teamKey);
+      .eq('team_key', req.params.teamKey);
 
     if (error) throw error;
     res.json({ ok: true });
@@ -261,27 +255,26 @@ router.patch('/:id/team/:teamKey', async (req, res) => {
 });
 
 // ── POST /api/sessions/:id/teams/:teamKey/points ──────────────────────────────
-// Add/subtract points atomically
 router.post('/:id/teams/:teamKey/points', async (req, res) => {
   try {
     const { password, delta } = req.body;
     await verifyHost(req.params.id, password);
 
     const { data: team, error: fetchErr } = await supabase
-      .from('teams')
+      .from('session_teams')
       .select('score')
       .eq('session_id', req.params.id)
-      .eq('key', req.params.teamKey)
+      .eq('team_key', req.params.teamKey)
       .single();
 
     if (fetchErr || !team) throw new Error('الفريق غير موجود');
 
     const newScore = Math.max(0, (team.score || 0) + (delta || 0));
     const { error } = await supabase
-      .from('teams')
+      .from('session_teams')
       .update({ score: newScore })
       .eq('session_id', req.params.id)
-      .eq('key', req.params.teamKey);
+      .eq('team_key', req.params.teamKey);
 
     if (error) throw error;
     res.json({ ok: true, score: newScore });
@@ -291,7 +284,6 @@ router.post('/:id/teams/:teamKey/points', async (req, res) => {
 });
 
 // ── DELETE /api/sessions/:id ──────────────────────────────────────────────────
-// Close/delete session (host only)
 router.delete('/:id', async (req, res) => {
   try {
     const { password } = req.body;
@@ -310,7 +302,6 @@ router.delete('/:id', async (req, res) => {
 });
 
 // ── POST /api/sessions/cleanup ───────────────────────────────────────────────
-// Protected cleanup — called by cron job
 router.post('/cleanup', async (req, res) => {
   try {
     const secret = req.headers['x-cleanup-secret'];
